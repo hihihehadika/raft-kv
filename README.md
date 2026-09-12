@@ -1,66 +1,88 @@
 # raft-kv
 
-A distributed key-value store with Raft consensus, built from scratch in Rust.
+![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+![Rust](https://img.shields.io/badge/rust-1.80%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-Goal: understand — by actually implementing it — how systems like etcd,
-CockroachDB, and TiKV keep data consistent across multiple machines.
+A distributed key-value store powered by the **Raft Consensus Algorithm**, built completely from scratch in Rust.
 
-## Roadmap
+This project was built to understand the inner workings of distributed systems and how industry-standard databases like etcd, CockroachDB, and TiKV keep data safe, consistent, and highly available across multiple machines.
 
-### Stage 1 — Single-node KV store (`src/store.rs`)
-Plain `HashMap<String, String>` behind `get` / `set` / `delete`. Nothing fancy —
-this stage exists so every later stage has a state machine to apply
-committed commands to.
+## Features
 
-**Done when:** you can run the binary, set a few keys, get them back.
+*   **Raft Consensus Protocol**: Full implementation of the Raft algorithm including leader election, log replication, and safety guarantees (based on the original [Raft paper](https://raft.github.io/raft.pdf)).
+*   **Write-Ahead Logging (WAL)**: Ensures data durability. Every transaction is appended and `fsync`-ed to disk before being applied to the in-memory state machine.
+*   **Log Compaction (Snapshotting)**: Prevents the log from growing indefinitely. The system automatically creates snapshots and sends `InstallSnapshot` RPCs to lagging followers.
+*   **Asynchronous Event Loop**: Built on top of `tokio` for efficient networking and non-blocking I/O multiplexing.
+*   **Custom RPC Layer**: A lightweight, TCP-based JSON RPC protocol with a 4-byte length prefix framing.
+*   **Interactive CLI Client**: A robust command-line client that handles transparent cluster routing (automatically redirects to the current leader if a follower is queried).
 
-### Stage 2 — Durability with a WAL (`src/wal.rs`)
-Every write goes to an append-only log file on disk *before* it's applied
-to the in-memory map. On startup, replay the log to rebuild state.
+## Architecture
 
-**Done when:** you can kill `-9` the process mid-run, restart it, and your
-data is still there.
+The project is structured in progressive components, separating the consensus logic from the transport and state machine layers:
 
-### Stage 3 — Raft consensus (`src/raft.rs`, `src/rpc.rs`)
-The main event. Implement:
-- Leader election (randomized timeouts, RequestVote RPC)
-- Log replication (AppendEntries RPC, majority commit)
-- The safety rules that make it actually correct, not just "looks like it works"
+1.  `store.rs`: The core in-memory Key-Value state machine (`HashMap`).
+2.  `wal.rs`: Disk persistence using append-only logs for crash recovery.
+3.  `raft.rs`: A **pure state machine** implementation of Raft. It does no I/O, making it 100% deterministic and incredibly easy to unit test.
+4.  `rpc.rs`: The `tokio` TCP networking layer that powers node-to-node communication and client routing.
+5.  `main.rs` & `cli.rs`: The asynchronous daemon and the user-facing command line interface.
 
-**Done when:** you can run 3–5 node processes on your machine, kill the
-leader, and watch a new one get elected automatically — with no data loss
-for committed writes.
+## Getting Started
 
-**Read first:** [In Search of an Understandable Consensus Algorithm (the
-Raft paper)](https://raft.github.io/raft.pdf) — read Section 5 closely, it's
-short and the figures (especially Figure 2) are basically your spec.
-[The Raft visualization](https://raft.github.io/) is also great for building
-intuition before you write a line of code.
+### Prerequisites
+*   [Rust & Cargo](https://rustup.rs/) (stable)
 
-### Stage 4 — Client CLI (`src/bin/cli.rs`)
-A small binary to `set` / `get` / `delete` against the cluster. Needs to
-handle "this node isn't the leader, redirect me" — that's normal Raft
-client behavior, not an edge case.
+### Running a Cluster locally
 
-**Done when:** you can drive the whole cluster from the command line.
+Open three separate terminals to start a 3-node cluster. They will automatically communicate, elect a leader, and start replicating data.
 
-### Stage 5 — Snapshotting (bonus, extends `wal.rs` + `raft.rs`)
-Without this, your WAL grows forever. Periodically dump the full state to
-a snapshot file and truncate the log before that point.
+**Node 0:**
+```bash
+cargo run --bin raft-kv-node -- --id 0 --addr 127.0.0.1:8001 --peers 1=127.0.0.1:8002,2=127.0.0.1:8003
+```
 
-**Done when:** a node that's way behind can catch up via a snapshot instead
-of replaying the entire log history.
+**Node 1:**
+```bash
+cargo run --bin raft-kv-node -- --id 1 --addr 127.0.0.1:8002 --peers 0=127.0.0.1:8001,2=127.0.0.1:8003
+```
 
-## Suggested commit cadence
+**Node 2:**
+```bash
+cargo run --bin raft-kv-node -- --id 2 --addr 127.0.0.1:8003 --peers 0=127.0.0.1:8001,1=127.0.0.1:8002
+```
 
-Commit at the end of each stage (or sub-step within a stage) rather than
-one giant commit at the end — this project is a great portfolio piece
-specifically *because* the commit history shows the system being built up
-incrementally.
+### Using the CLI
 
-## Notes
+In a fourth terminal, use the CLI client to interact with the cluster. By default, it knows the addresses of all 3 nodes and will automatically find the leader.
 
-- Every module currently has `todo!()` stubs with comments describing what
-  to implement and in what order — start with `store.rs`.
-- Dependency suggestions for each stage are commented out in `Cargo.toml`;
-  uncomment as you reach that stage instead of pulling everything in at once.
+**Write data:**
+```bash
+cargo run --bin raft-kv-cli -- set user:1 "Alice"
+cargo run --bin raft-kv-cli -- set user:2 "Bob"
+```
+
+**Read data:**
+```bash
+cargo run --bin raft-kv-cli -- get user:1
+# Output: Success: Alice
+```
+
+**Delete data:**
+```bash
+cargo run --bin raft-kv-cli -- delete user:2
+```
+
+### Simulating Failures
+
+You can safely `Ctrl+C` the leader node. If you watch the logs on the remaining two nodes, you will see an election timeout fire, followed by a new leader being elected. The cluster will continue to accept writes and reads as long as a majority (2 out of 3 nodes) is alive.
+
+## Testing
+
+The pure state machine design of the core consensus layer allows for rigorous unit testing without network mocks.
+
+```bash
+cargo test
+```
+
+## Acknowledgements
+*   [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) by Diego Ongaro and John Ousterhout.
