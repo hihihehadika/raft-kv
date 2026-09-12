@@ -17,11 +17,8 @@ path = "src/bin/cli.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Stage 3 (networking between nodes):
-# tokio = { version = "1", features = ["full"] }
-# tonic = "0.11"      # if you go gRPC route for RPCs
-# prost = "0.12"
-# bincode = "1"       # binary serialization, often used in Raft impls
+# Stage 3: async networking between nodes
+tokio = { version = "1", features = ["full"] }
 
 # Stage 4 (CLI client):
 # clap = { version = "4", features = ["derive"] }
