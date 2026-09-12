@@ -93,27 +93,12 @@ pub struct AppendEntriesReply {
     pub match_index: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstallSnapshotArgs {
-    pub term: u64,
-    pub leader_id: u64,
-    pub last_included_index: u64,
-    pub last_included_term: u64,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstallSnapshotReply {
-    pub term: u64,
-}
-
 /// Messages the state machine wants to send to peers.
 /// The caller (main / rpc layer) is responsible for actual delivery.
 #[derive(Debug, Clone)]
 pub enum OutboundMsg {
     RequestVote { to: u64, args: RequestVoteArgs },
     AppendEntries { to: u64, args: AppendEntriesArgs },
-    InstallSnapshot { to: u64, args: InstallSnapshotArgs },
 }
 
 // ---------------------------------------------------------------------------
@@ -127,12 +112,7 @@ pub struct RaftNode {
     pub id: u64,
     pub current_term: u64,
     pub voted_for: Option<u64>,
-    
-    // Snapshotting state
-    pub last_included_index: u64,
-    pub last_included_term: u64,
-    
-    /// log[0] is always a sentinel entry representing last_included_index.
+    /// log[0] is a sentinel entry (term=0) so prevLogIndex=0 is always valid.
     pub log: Vec<LogEntry>,
 
     // -----------------------------------------------------------------------
@@ -167,9 +147,7 @@ impl RaftNode {
             id,
             current_term: 0,
             voted_for: None,
-            last_included_index: 0,
-            last_included_term: 0,
-            // Index 0 is a sentinel representing last_included_index/term
+            // Index 0 is a sentinel; real entries start at index 1.
             log: vec![LogEntry {
                 term: 0,
                 command: Command::Set { key: String::new(), value: String::new() },
@@ -189,20 +167,8 @@ impl RaftNode {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    fn physical(&self, logical_index: u64) -> Option<usize> {
-        if logical_index < self.last_included_index {
-            None
-        } else {
-            Some((logical_index - self.last_included_index) as usize)
-        }
-    }
-
-    fn logical(&self, physical_index: usize) -> u64 {
-        self.last_included_index + physical_index as u64
-    }
-
     fn last_log_index(&self) -> u64 {
-        self.logical(self.log.len() - 1)
+        (self.log.len() - 1) as u64
     }
 
     fn last_log_term(&self) -> u64 {
@@ -326,9 +292,9 @@ impl RaftNode {
         self.leader_id = Some(self.id);
 
         // Re-initialize nextIndex[] and matchIndex[] for all peers
-        let next = self.last_log_index() + 1;
+        let next = self.log.len(); // one past our last entry
         for &peer in &self.peers {
-            self.next_index.insert(peer, next as usize);
+            self.next_index.insert(peer, next);
             self.match_index.insert(peer, 0);
         }
 
@@ -358,30 +324,24 @@ impl RaftNode {
         }
         self.leader_id = Some(args.leader_id);
 
-        let prev_logical = args.prev_log_index;
-        
-        // If prev_log_index is behind our snapshot, we can't safely append it directly.
-        // Usually, InstallSnapshot handles this. For AppendEntries, we just reject if it's too old.
-        if prev_logical < self.last_included_index {
-            return reject(self.current_term);
-        }
+        let prev_idx = args.prev_log_index as usize;
 
-        let prev_physical = self.physical(prev_logical).unwrap();
-
-        // Rule 2: reject if our log is missing prevLogIndex, or the term there doesn't match
-        if prev_physical >= self.log.len() || self.log[prev_physical].term != args.prev_log_term {
+        // Rule 2: reject if our log is missing prevLogIndex, or the term there
+        // doesn't match prevLogTerm (log consistency check)
+        if prev_idx >= self.log.len() || self.log[prev_idx].term != args.prev_log_term {
             return reject(self.current_term);
         }
 
         // Rules 3 & 4: merge entries into our log
         for (offset, new_entry) in args.entries.iter().enumerate() {
-            let physical_idx = prev_physical + 1 + offset;
-            if physical_idx < self.log.len() {
-                if self.log[physical_idx].term != new_entry.term {
+            let idx = prev_idx + 1 + offset;
+            if idx < self.log.len() {
+                if self.log[idx].term != new_entry.term {
                     // Conflict: truncate our log and append from here
-                    self.log.truncate(physical_idx);
+                    self.log.truncate(idx);
                     self.log.push(new_entry.clone());
                 }
+                // else: already have this identical entry, skip
             } else {
                 self.log.push(new_entry.clone());
             }
@@ -389,10 +349,11 @@ impl RaftNode {
 
         // Rule 5: advance commitIndex
         if args.leader_commit > self.commit_index as u64 {
-            self.commit_index = (args.leader_commit as usize).min(self.logical(self.log.len() - 1) as usize);
+            self.commit_index =
+                (args.leader_commit as usize).min(self.log.len() - 1);
         }
 
-        let match_index = prev_logical + args.entries.len() as u64;
+        let match_index = (prev_idx + args.entries.len()) as u64;
         (
             AppendEntriesReply { term: self.current_term, success: true, match_index },
             vec![],
@@ -431,92 +392,6 @@ impl RaftNode {
     }
 
     // -----------------------------------------------------------------------
-    // Handle incoming InstallSnapshot RPC
-    // -----------------------------------------------------------------------
-    pub fn handle_install_snapshot(
-        &mut self,
-        args: InstallSnapshotArgs,
-    ) -> (InstallSnapshotReply, Vec<OutboundMsg>) {
-        if args.term < self.current_term {
-            return (InstallSnapshotReply { term: self.current_term }, vec![]);
-        }
-
-        if args.term > self.current_term || self.state != NodeState::Follower {
-            self.become_follower(args.term);
-        }
-        self.leader_id = Some(args.leader_id);
-
-        if args.last_included_index <= self.last_included_index {
-            return (InstallSnapshotReply { term: self.current_term }, vec![]);
-        }
-
-        // If we have existing log entries that overlap with the snapshot, we could retain them.
-        // But for simplicity (and as allowed by Raft), we just clear the log and adopt the snapshot.
-        self.last_included_index = args.last_included_index;
-        self.last_included_term = args.last_included_term;
-        self.log.clear();
-        self.log.push(LogEntry {
-            term: self.last_included_term,
-            command: Command::Set { key: String::new(), value: String::new() }, // sentinel
-        });
-
-        self.commit_index = self.last_included_index as usize;
-        // The store application logic will jump `last_applied` forward automatically.
-
-        (InstallSnapshotReply { term: self.current_term }, vec![])
-    }
-
-    // -----------------------------------------------------------------------
-    // Handle reply to InstallSnapshot we sent
-    // -----------------------------------------------------------------------
-    pub fn handle_install_snapshot_reply(
-        &mut self,
-        from: u64,
-        reply: InstallSnapshotReply,
-    ) -> Vec<OutboundMsg> {
-        if reply.term > self.current_term {
-            self.become_follower(reply.term);
-            return vec![];
-        }
-        if self.state != NodeState::Leader {
-            return vec![];
-        }
-
-        // The follower has successfully installed the snapshot!
-        // We can update its matchIndex and nextIndex to the snapshot's end.
-        self.match_index.insert(from, self.last_included_index as usize);
-        self.next_index.insert(from, (self.last_included_index + 1) as usize);
-
-        self.try_advance_commit_index();
-        vec![]
-    }
-
-    // -----------------------------------------------------------------------
-    // Log Compaction / Snapshotting (Stage 5)
-    // -----------------------------------------------------------------------
-    pub fn compact_log(&mut self, up_to_index: u64) {
-        if up_to_index <= self.last_included_index || up_to_index > (self.commit_index as u64) {
-            return; // invalid index to compact
-        }
-
-        let physical_idx = self.physical(up_to_index).unwrap();
-        let term = self.log[physical_idx].term;
-
-        // Retain entries from `physical_idx` onwards
-        let retained = self.log[physical_idx..].to_vec();
-        
-        self.log = retained;
-        // Overwrite the first retained element to be the sentinel
-        self.log[0] = LogEntry {
-            term,
-            command: Command::Set { key: String::new(), value: String::new() },
-        };
-
-        self.last_included_index = up_to_index;
-        self.last_included_term = term;
-    }
-
-    // -----------------------------------------------------------------------
     // Leader: try to advance commitIndex  (§5.3 — leader commit rule)
     //
     // Find the highest N such that:
@@ -525,17 +400,14 @@ impl RaftNode {
     //   • a majority of nodes have matchIndex >= N
     // -----------------------------------------------------------------------
     fn try_advance_commit_index(&mut self) {
-        let last_logical = self.last_log_index();
-        let start = (self.commit_index as u64 + 1).max(self.last_included_index + 1);
-        
-        for n in (start..=last_logical).rev() {
-            let physical_idx = self.physical(n).unwrap();
-            if self.log[physical_idx].term != self.current_term {
+        let last = self.log.len() - 1;
+        for n in ((self.commit_index + 1)..=last).rev() {
+            if self.log[n].term != self.current_term {
                 continue; // never commit entries from previous terms directly
             }
-            let replicated = self.match_index.values().filter(|&&mi| mi >= n as usize).count() + 1; // +1 = self
+            let replicated = self.match_index.values().filter(|&&mi| mi >= n).count() + 1; // +1 = self
             if replicated >= self.majority() {
-                self.commit_index = n as usize;
+                self.commit_index = n;
                 break;
             }
         }
@@ -567,16 +439,10 @@ impl RaftNode {
     // Returns how many entries were applied.
     // -----------------------------------------------------------------------
     pub fn apply_committed(&mut self, store: &mut KvStore) -> usize {
-        // If a snapshot advanced our state past what we applied, jump forward.
-        if (self.last_applied as u64) < self.last_included_index {
-            self.last_applied = self.last_included_index as usize;
-        }
-
         let mut count = 0;
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
-            let physical_idx = self.physical(self.last_applied as u64).unwrap();
-            match self.log[physical_idx].command.clone() {
+            match self.log[self.last_applied].command.clone() {
                 Command::Set { key, value } => store.set(key, value),
                 Command::Delete { key } => { store.delete(&key); }
             }
@@ -601,44 +467,23 @@ impl RaftNode {
     }
 
     fn build_append_entries_for(&self, peer: u64, next: usize) -> Vec<OutboundMsg> {
-        let next_logical = next as u64;
-
-        if next_logical <= self.last_included_index {
-            // Peer is too far behind, must send InstallSnapshot.
-            // In this demo, we assume the snapshot data is already handled or we send empty data
-            // (since the real implementation would pass the serialized store).
-            // To make this fully complete, we'd need access to KvStore here, but this is sufficient
-            // for the Raft logic part (the actual data transfer could be out-of-band).
-            return vec![OutboundMsg::InstallSnapshot {
-                to: peer,
-                args: InstallSnapshotArgs {
-                    term: self.current_term,
-                    leader_id: self.id,
-                    last_included_index: self.last_included_index,
-                    last_included_term: self.last_included_term,
-                    data: vec![], // placeholder
-                },
-            }];
-        }
-
-        let prev_logical = next_logical.saturating_sub(1);
-        let prev_physical = self.physical(prev_logical).unwrap();
-        
-        let prev_log_term = self.log[prev_physical].term;
-        let next_physical = self.physical(next_logical).unwrap_or(self.log.len());
-        
-        let entries = if next_physical < self.log.len() {
-            self.log[next_physical..].to_vec()
+        let prev_log_index = next.saturating_sub(1);
+        let prev_log_term = if prev_log_index < self.log.len() {
+            self.log[prev_log_index].term
+        } else {
+            0
+        };
+        let entries = if next < self.log.len() {
+            self.log[next..].to_vec()
         } else {
             vec![]
         };
-
         vec![OutboundMsg::AppendEntries {
             to: peer,
             args: AppendEntriesArgs {
                 term: self.current_term,
                 leader_id: self.id,
-                prev_log_index: prev_logical,
+                prev_log_index: prev_log_index as u64,
                 prev_log_term,
                 entries,
                 leader_commit: self.commit_index as u64,
@@ -682,12 +527,6 @@ mod tests {
                         let (reply, out) = nodes[to as usize].handle_append_entries(args);
                         next.extend(out);
                         next.extend(nodes[leader as usize].handle_append_entries_reply(to, reply));
-                    }
-                    OutboundMsg::InstallSnapshot { to, args } => {
-                        let leader = args.leader_id;
-                        let (reply, out) = nodes[to as usize].handle_install_snapshot(args);
-                        next.extend(out);
-                        next.extend(nodes[leader as usize].handle_install_snapshot_reply(to, reply));
                     }
                 }
             }

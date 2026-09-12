@@ -62,8 +62,6 @@ pub enum RpcMessage {
     RequestVoteReply(Envelope<RequestVoteReply>),
     AppendEntries(Envelope<AppendEntriesArgs>),
     AppendEntriesReply(Envelope<AppendEntriesReply>),
-    InstallSnapshot(Envelope<crate::raft::InstallSnapshotArgs>),
-    InstallSnapshotReply(Envelope<crate::raft::InstallSnapshotReply>),
     ClientRequest(ClientRequest),
     ClientReply(ClientReply),
 }
@@ -242,10 +240,6 @@ pub fn to_wire(from: u64, msg: OutboundMsg) -> (u64, RpcMessage) {
         OutboundMsg::AppendEntries { to, args } => (
             to,
             RpcMessage::AppendEntries(Envelope { from, to, payload: args }),
-        ),
-        OutboundMsg::InstallSnapshot { to, args } => (
-            to,
-            RpcMessage::InstallSnapshot(Envelope { from, to, payload: args }),
         ),
     }
 }

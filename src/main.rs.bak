@@ -159,20 +159,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let msgs = node.handle_append_entries_reply(env.from, env.payload);
                         dispatch(msgs, &rpc_client);
                     }
-                    RpcMessage::InstallSnapshot(env) => {
-                        reset_election = true;
-                        let (reply, msgs) = node.handle_install_snapshot(env.payload);
-                        dispatch(msgs, &rpc_client);
-                        rpc_client.send(env.from, &RpcMessage::InstallSnapshotReply(raft_kv::rpc::Envelope {
-                            from: cli.id,
-                            to: env.from,
-                            payload: reply,
-                        })).await;
-                    }
-                    RpcMessage::InstallSnapshotReply(env) => {
-                        let msgs = node.handle_install_snapshot_reply(env.from, env.payload);
-                        dispatch(msgs, &rpc_client);
-                    }
                     RpcMessage::ClientRequest(req) => {
                         // Handle request from the CLI client
                         let reply = match req {
@@ -228,13 +214,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let applied = node.apply_committed(&mut store);
                 if applied > 0 {
                     println!("[node {}] Applied {} entries to state machine. Commit index: {}", cli.id, applied, node.commit_index);
-                }
-
-                // Stage 5: Log Compaction
-                if node.log.len() > 20 {
-                    let compact_to = node.commit_index as u64;
-                    println!("[node {}] Log size exceeded 20, compacting up to index {}...", cli.id, compact_to);
-                    node.compact_log(compact_to);
                 }
             }
         }
