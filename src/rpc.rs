@@ -38,7 +38,21 @@ pub struct Envelope<T> {
     pub payload: T,
 }
 
-/// All peer-to-peer RPC messages on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientRequest {
+    Get { key: String },
+    Set { key: String, value: String },
+    Delete { key: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientReply {
+    Success { value: Option<String> },
+    NotLeader { leader_id: Option<u64> },
+    Error { message: String },
+}
+
+/// All peer-to-peer and client-to-node RPC messages on the wire.
 /// `#[serde(tag = "type")]` adds a `"type": "..."` discriminant field so
 /// the receiver knows how to deserialize the payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +62,16 @@ pub enum RpcMessage {
     RequestVoteReply(Envelope<RequestVoteReply>),
     AppendEntries(Envelope<AppendEntriesArgs>),
     AppendEntriesReply(Envelope<AppendEntriesReply>),
+    ClientRequest(ClientRequest),
+    ClientReply(ClientReply),
+}
+
+/// Wraps an incoming message with an optional oneshot channel for replying.
+/// This is primarily used so the main node loop can reply directly to clients
+/// over the exact same TCP socket the client connected with.
+pub struct Inbound {
+    pub msg: RpcMessage,
+    pub reply_tx: Option<tokio::sync::oneshot::Sender<RpcMessage>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,17 +112,11 @@ pub async fn read_frame(stream: &mut TcpStream) -> io::Result<RpcMessage> {
 // ---------------------------------------------------------------------------
 
 /// Listens on `addr` and forwards every received `RpcMessage` to `inbox_tx`.
-/// Spawn this as a dedicated tokio task:
-///
-/// ```ignore
-/// let server = RpcServer { addr, node_id, inbox_tx };
-/// tokio::spawn(server.run());
-/// ```
 pub struct RpcServer {
     pub addr: SocketAddr,
     pub node_id: u64,
     /// The node's inbound message channel.
-    pub inbox_tx: mpsc::Sender<RpcMessage>,
+    pub inbox_tx: mpsc::Sender<Inbound>,
 }
 
 impl RpcServer {
@@ -114,20 +132,37 @@ impl RpcServer {
             let tx = self.inbox_tx.clone();
             let node_id = self.node_id;
 
-            // One tokio task per open connection; handles the full lifetime of
-            // that connection (could be reused across multiple messages).
             tokio::spawn(async move {
                 loop {
                     match read_frame(&mut stream).await {
                         Ok(msg) => {
-                            if tx.send(msg).await.is_err() {
-                                // Receiver (node) has shut down
-                                break;
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            
+                            let inbound = Inbound {
+                                msg: msg.clone(),
+                                // Only attach reply_tx for client requests, peers are fire-and-forget
+                                reply_tx: if matches!(msg, RpcMessage::ClientRequest(_)) {
+                                    Some(reply_tx)
+                                } else {
+                                    None
+                                },
+                            };
+
+                            if tx.send(inbound).await.is_err() {
+                                break; // Receiver (node) shut down
+                            }
+
+                            // If it's a client request, wait for the node to reply and send it back
+                            if matches!(msg, RpcMessage::ClientRequest(_)) {
+                                if let Ok(reply_msg) = reply_rx.await {
+                                    let _ = write_frame(&mut stream, &reply_msg).await;
+                                }
+                                // CLI clients typically disconnect after one request, 
+                                // but we continue listening just in case.
                             }
                         }
                         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            // Peer closed connection cleanly
-                            break;
+                            break; // Peer closed connection cleanly
                         }
                         Err(e) => {
                             eprintln!(
@@ -152,6 +187,7 @@ impl RpcServer {
 /// This is fire-and-forget: if the peer is unreachable (crashed, partitioned),
 /// the error is silently swallowed.  Raft is designed to handle this — the
 /// leader will retry via the next heartbeat.
+#[derive(Clone)]
 pub struct RpcClient {
     /// Map of node ID → TCP address.
     pub peer_addrs: HashMap<u64, SocketAddr>,

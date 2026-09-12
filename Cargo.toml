@@ -20,5 +20,6 @@ serde_json = "1"
 # Stage 3: async networking between nodes
 tokio = { version = "1", features = ["full"] }
 
-# Stage 4 (CLI client):
-# clap = { version = "4", features = ["derive"] }
+# Stage 4: CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"

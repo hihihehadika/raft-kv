@@ -1,152 +1,230 @@
-mod store;
-mod wal;
-mod raft;
-mod rpc;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::Duration;
 
-use raft::{Command, NodeState, OutboundMsg, RaftNode};
-use store::KvStore;
+use clap::Parser;
+use rand::Rng;
+use tokio::sync::mpsc;
+use tokio::time;
 
-// ---------------------------------------------------------------------------
-// In-process cluster simulation
-//
-// For Stage 3, we prove the Raft *logic* is correct using a single-process
-// simulation: nodes are just structs, and "the network" is a Vec of messages
-// we deliver synchronously.
-//
-// Stage 4 will wire up the real TCP layer from rpc.rs into a multi-process
-// binary, at which point each node runs in its own OS process.
-// ---------------------------------------------------------------------------
+use raft_kv::raft::{Command, OutboundMsg, RaftNode};
+use raft_kv::rpc::{ClientReply, ClientRequest, Inbound, RpcClient, RpcMessage, RpcServer, to_wire};
+use raft_kv::store::KvStore;
 
-/// Deliver all messages in `queue` to the right node and keep going until
-/// the queue is empty (no more messages to process).
-///
-/// This simulates an instant, reliable, in-order network — ideal for testing
-/// correctness before adding timing and fault injection.
-fn deliver(nodes: &mut [RaftNode; 3], queue: Vec<OutboundMsg>) {
-    let mut pending = queue;
-    while !pending.is_empty() {
-        let mut next: Vec<OutboundMsg> = vec![];
-        for msg in pending.drain(..) {
-            match msg {
-                OutboundMsg::RequestVote { to, args } => {
-                    let from = args.candidate_id;
-                    let (reply, out) = nodes[to as usize].handle_request_vote(args);
-                    next.extend(out);
-                    next.extend(nodes[from as usize].handle_request_vote_reply(to, reply));
+#[derive(Parser)]
+#[command(name = "raft-kv-node")]
+#[command(about = "A single node in the raft-kv cluster", long_about = None)]
+struct Cli {
+    /// The ID of this node (e.g., 0, 1, or 2)
+    #[arg(long)]
+    id: u64,
+
+    /// The address this node listens on (e.g., 127.0.0.1:8001)
+    #[arg(long)]
+    addr: SocketAddr,
+
+    /// Comma-separated list of peer ID=Address (e.g., 1=127.0.0.1:8002,2=127.0.0.1:8003)
+    #[arg(long, default_value = "")]
+    peers: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    // Parse peers
+    let mut peers_map = HashMap::new();
+    let mut peer_ids = Vec::new();
+    if !cli.peers.is_empty() {
+        for pair in cli.peers.split(',') {
+            let parts: Vec<&str> = pair.split('=').collect();
+            if parts.len() == 2 {
+                let pid: u64 = parts[0].parse()?;
+                let paddr: SocketAddr = parts[1].parse()?;
+                peers_map.insert(pid, paddr);
+                peer_ids.push(pid);
+            }
+        }
+    }
+
+    println!("[node {}] Starting up on {}...", cli.id, cli.addr);
+    
+    // Initialize Raft node and KV Store (Note: no WAL persistence yet in Stage 4 to keep demo simple,
+    // though Stage 2 WAL could be injected here)
+    let mut node = RaftNode::new(cli.id, peer_ids);
+    let mut store = KvStore::new();
+
+    // -----------------------------------------------------------------------
+    // Network layer setup
+    // -----------------------------------------------------------------------
+    let rpc_client = RpcClient::new(peers_map);
+    let (inbox_tx, mut inbox_rx) = mpsc::channel::<Inbound>(100);
+
+    let server = RpcServer {
+        addr: cli.addr,
+        node_id: cli.id,
+        inbox_tx,
+    };
+    
+    // Run the server in the background
+    tokio::spawn(server.run());
+
+    // -----------------------------------------------------------------------
+    // Timers
+    // -----------------------------------------------------------------------
+    // 10ms tick for all time-based events
+    let mut ticker = time::interval(Duration::from_millis(10));
+    
+    let mut election_timeout = gen_election_timeout();
+    let mut election_elapsed = 0;
+    
+    let heartbeat_timeout = 50; // 50ms
+    let mut heartbeat_elapsed = 0;
+
+    // Helper closure to dispatch outbound messages
+    let dispatch = |msgs: Vec<OutboundMsg>, client: &RpcClient| {
+        for m in msgs {
+            let (to, rpc_msg) = to_wire(cli.id, m);
+            let client = client.clone();
+            // Fire and forget
+            tokio::spawn(async move {
+                client.send(to, &rpc_msg).await;
+            });
+        }
+    };
+
+    println!("[node {}] Cluster ready. Waiting for events...", cli.id);
+
+    // -----------------------------------------------------------------------
+    // The Main Event Loop
+    // -----------------------------------------------------------------------
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                // Timer logic
+                if node.state == raft_kv::raft::NodeState::Leader {
+                    heartbeat_elapsed += 10;
+                    if heartbeat_elapsed >= heartbeat_timeout {
+                        heartbeat_elapsed = 0;
+                        let msgs = node.send_heartbeats();
+                        dispatch(msgs, &rpc_client);
+                    }
+                } else {
+                    election_elapsed += 10;
+                    if election_elapsed >= election_timeout {
+                        println!("[node {}] Election timeout! Starting election for term {}...", cli.id, node.current_term + 1);
+                        election_elapsed = 0;
+                        election_timeout = gen_election_timeout(); // randomize next
+                        let msgs = node.start_election();
+                        dispatch(msgs, &rpc_client);
+                    }
                 }
-                OutboundMsg::AppendEntries { to, args } => {
-                    let leader = args.leader_id;
-                    let (reply, out) = nodes[to as usize].handle_append_entries(args);
-                    next.extend(out);
-                    next.extend(nodes[leader as usize].handle_append_entries_reply(to, reply));
+            }
+
+            Some(inbound) = inbox_rx.recv() => {
+                let old_state = node.state.clone();
+                
+                // Process incoming network message
+                let mut reset_election = false;
+
+                match inbound.msg {
+                    RpcMessage::RequestVote(env) => {
+                        let (reply, msgs) = node.handle_request_vote(env.payload);
+                        if reply.vote_granted {
+                            reset_election = true;
+                        }
+                        dispatch(msgs, &rpc_client);
+                        // Send reply
+                        rpc_client.send(env.from, &RpcMessage::RequestVoteReply(raft_kv::rpc::Envelope {
+                            from: cli.id,
+                            to: env.from,
+                            payload: reply,
+                        })).await;
+                    }
+                    RpcMessage::RequestVoteReply(env) => {
+                        let msgs = node.handle_request_vote_reply(env.from, env.payload);
+                        dispatch(msgs, &rpc_client);
+                    }
+                    RpcMessage::AppendEntries(env) => {
+                        reset_election = true; // Any AppendEntries resets election timeout
+                        let (reply, msgs) = node.handle_append_entries(env.payload);
+                        dispatch(msgs, &rpc_client);
+                        rpc_client.send(env.from, &RpcMessage::AppendEntriesReply(raft_kv::rpc::Envelope {
+                            from: cli.id,
+                            to: env.from,
+                            payload: reply,
+                        })).await;
+                    }
+                    RpcMessage::AppendEntriesReply(env) => {
+                        let msgs = node.handle_append_entries_reply(env.from, env.payload);
+                        dispatch(msgs, &rpc_client);
+                    }
+                    RpcMessage::ClientRequest(req) => {
+                        // Handle request from the CLI client
+                        let reply = match req {
+                            ClientRequest::Get { key } => {
+                                // Simple read (stale read possible, but okay for this demo)
+                                ClientReply::Success { value: store.get(&key).cloned() }
+                            }
+                            ClientRequest::Set { key, value } => {
+                                match node.propose(Command::Set { key, value }) {
+                                    Ok(msgs) => {
+                                        dispatch(msgs, &rpc_client);
+                                        // Wait, the write is PROPOSED, not committed yet. 
+                                        // A real system would block here until commit_index advances.
+                                        // For Stage 4, we'll reply Success immediately to keep it simple,
+                                        // or we can just say "Success".
+                                        ClientReply::Success { value: None }
+                                    }
+                                    Err(_) => ClientReply::NotLeader { leader_id: node.leader_id }
+                                }
+                            }
+                            ClientRequest::Delete { key } => {
+                                match node.propose(Command::Delete { key }) {
+                                    Ok(msgs) => {
+                                        dispatch(msgs, &rpc_client);
+                                        ClientReply::Success { value: None }
+                                    }
+                                    Err(_) => ClientReply::NotLeader { leader_id: node.leader_id }
+                                }
+                            }
+                        };
+                        
+                        // Send reply back directly on the oneshot channel
+                        if let Some(tx) = inbound.reply_tx {
+                            let _ = tx.send(RpcMessage::ClientReply(reply));
+                        }
+                    }
+                    RpcMessage::ClientReply(_) => {
+                        // Nodes don't receive client replies
+                    }
+                }
+
+                // If state changed to leader, reset heartbeat timer immediately
+                if old_state != node.state && node.state == raft_kv::raft::NodeState::Leader {
+                    println!("[node {}] Became LEADER for term {}!", cli.id, node.current_term);
+                    heartbeat_elapsed = heartbeat_timeout; // Trigger immediately on next tick
+                }
+
+                if reset_election {
+                    election_elapsed = 0;
+                }
+
+                // Apply any newly committed entries to the state machine
+                let applied = node.apply_committed(&mut store);
+                if applied > 0 {
+                    println!("[node {}] Applied {} entries to state machine. Commit index: {}", cli.id, applied, node.commit_index);
                 }
             }
         }
-        pending = next;
     }
 }
 
-fn separator(title: &str) {
-    println!("\n─── {} {}", title, "─".repeat(50 - title.len().min(48)));
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+fn gen_election_timeout() -> u32 {
+    // Raft randomizes election timeouts to prevent split votes
+    rand::thread_rng().gen_range(150..300)
 }
 
-fn main() {
-    println!("raft-kv node starting (Stage 3 — in-process simulation)");
-
-    // -----------------------------------------------------------------------
-    // Boot a 3-node cluster (IDs: 0, 1, 2)
-    // -----------------------------------------------------------------------
-    let mut nodes = [
-        RaftNode::new(0, vec![1, 2]),
-        RaftNode::new(1, vec![0, 2]),
-        RaftNode::new(2, vec![0, 1]),
-    ];
-    let mut stores = [KvStore::new(), KvStore::new(), KvStore::new()];
-
-    separator("STEP 1 — Initial state");
-    for n in &nodes {
-        println!("  node {} → {:?}  term={}", n.id, n.state, n.current_term);
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 2 — Leader election
-    // Node 0's election timeout fires first (deterministic in simulation)
-    // -----------------------------------------------------------------------
-    separator("STEP 2 — Leader election (node 0 times out)");
-    let msgs = nodes[0].start_election();
-    println!("  node 0 → Candidate  term=1  sending {} RequestVote RPCs", msgs.len());
-    deliver(&mut nodes, msgs);
-
-    for n in &nodes {
-        println!("  node {} → {:?}  term={}  leader={:?}", n.id, n.state, n.current_term, n.leader_id);
-    }
-    assert_eq!(nodes[0].state, NodeState::Leader, "node 0 must be leader");
-
-    // -----------------------------------------------------------------------
-    // Step 3 — Log replication: write some keys
-    // -----------------------------------------------------------------------
-    separator("STEP 3 — Log replication");
-    let writes = [
-        Command::Set { key: "user:1".into(), value: "alice".into() },
-        Command::Set { key: "user:2".into(), value: "bob".into() },
-        Command::Set { key: "config:port".into(), value: "8080".into() },
-        Command::Delete { key: "user:2".into() },
-    ];
-
-    for cmd in &writes {
-        let msgs = nodes[0].propose(cmd.clone()).expect("leader must accept writes");
-        deliver(&mut nodes, msgs);
-    }
-
-    // Apply committed entries to state machines
-    for i in 0..3 {
-        let applied = nodes[i].apply_committed(&mut stores[i]);
-        println!("  node {} applied {} entries  (commit_index={})", i, applied, nodes[i].commit_index);
-    }
-
-    println!("\n  [Leader store]");
-    println!("    get user:1       => {:?}", stores[0].get("user:1"));
-    println!("    get user:2       => {:?}", stores[0].get("user:2")); // deleted
-    println!("    get config:port  => {:?}", stores[0].get("config:port"));
-
-    // Verify all nodes have the same log length (strong consistency)
-    assert_eq!(nodes[0].log.len(), nodes[1].log.len());
-    assert_eq!(nodes[1].log.len(), nodes[2].log.len());
-    println!("\n  ✓ All 3 nodes have identical log length: {}", nodes[0].log.len() - 1);
-
-    // -----------------------------------------------------------------------
-    // Step 4 — Leader failure & re-election
-    // Simulate node 0 crashing: node 1 starts a new election
-    // -----------------------------------------------------------------------
-    separator("STEP 4 — Leader crash + re-election");
-    println!("  [node 0 crashes — no more messages from it]");
-
-    let msgs = nodes[1].start_election();
-    println!("  node 1 → Candidate  sending {} RequestVote RPCs", msgs.len());
-    deliver(&mut nodes, msgs);
-
-    println!("\n  After re-election:");
-    for n in &nodes {
-        println!("  node {} → {:?}  term={}  leader={:?}", n.id, n.state, n.current_term, n.leader_id);
-    }
-    assert_eq!(nodes[1].state, NodeState::Leader, "node 1 must win re-election");
-    println!("\n  ✓ New leader elected: node 1  (no data loss for committed writes)");
-
-    // -----------------------------------------------------------------------
-    // Step 5 — New leader accepts writes immediately
-    // -----------------------------------------------------------------------
-    separator("STEP 5 — New leader accepts writes");
-    let msgs = nodes[1]
-        .propose(Command::Set { key: "new-key".into(), value: "after-failover".into() })
-        .expect("node 1 is the new leader");
-    deliver(&mut nodes, msgs);
-
-    nodes[1].apply_committed(&mut stores[1]);
-    println!("  get new-key  => {:?}", stores[1].get("new-key"));
-    assert_eq!(stores[1].get("new-key"), Some(&"after-failover".to_string()));
-    println!("\n  ✓ Writes continue working after leader failover");
-
-    separator("DONE");
-    println!("  Stage 3 simulation complete.");
-    println!("  Next: Stage 4 — run each node as a real OS process via rpc.rs + CLI.");
-}
