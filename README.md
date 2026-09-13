@@ -2,7 +2,6 @@
 
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 ![Rust](https://img.shields.io/badge/rust-1.80%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
 
 A distributed key-value store powered by the **Raft Consensus Algorithm**, built completely from scratch in Rust.
 
