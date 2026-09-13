@@ -17,6 +17,14 @@ impl KvStore {
         }
     }
 
+    pub fn dump(&self) -> HashMap<String, String> {
+        self.data.clone()
+    }
+
+    pub fn load(&mut self, data: HashMap<String, String>) {
+        self.data = data;
+    }
+
     /// Returns a reference to the value for `key`, or `None` if not found.
     pub fn get(&self, key: &str) -> Option<&String> {
         self.data.get(key)

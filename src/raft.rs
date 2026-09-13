@@ -27,7 +27,7 @@ pub enum Command {
 }
 
 /// One entry in the replicated log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogEntry {
     /// Term when this entry was created by the leader.
     pub term: u64,
@@ -544,12 +544,15 @@ impl RaftNode {
     // -----------------------------------------------------------------------
     // Leader: accept a client command and start replication
     // -----------------------------------------------------------------------
-    pub fn propose(&mut self, command: Command) -> Result<Vec<OutboundMsg>, &'static str> {
+    pub fn propose(&mut self, command: Command) -> Result<(u64, Vec<OutboundMsg>), &'static str> {
         if self.state != NodeState::Leader {
             return Err("not leader");
         }
         self.log.push(LogEntry { term: self.current_term, command });
-        Ok(self.broadcast_append_entries())
+        let logical_index = self.last_log_index();
+        let msgs = self.broadcast_append_entries();
+        self.try_advance_commit_index(); // Advance immediately if we are a 1-node cluster
+        Ok((logical_index, msgs))
     }
 
     // -----------------------------------------------------------------------
@@ -796,7 +799,7 @@ mod tests {
         assert_eq!(nodes[0].state, NodeState::Leader);
 
         // Propose a write
-        let msgs = nodes[0]
+        let (_, msgs) = nodes[0]
             .propose(Command::Set { key: "hello".into(), value: "raft".into() })
             .unwrap();
         flush(&mut nodes, msgs);
@@ -816,7 +819,7 @@ mod tests {
         let msgs = nodes[0].start_election();
         flush(&mut nodes, msgs);
 
-        let msgs = nodes[0]
+        let (_, msgs) = nodes[0]
             .propose(Command::Set { key: "k".into(), value: "v".into() })
             .unwrap();
         flush(&mut nodes, msgs);
@@ -864,7 +867,7 @@ mod tests {
             Command::Delete { key: "a".into() },
         ];
         for cmd in writes {
-            let msgs = nodes[0].propose(cmd).unwrap();
+            let (_, msgs) = nodes[0].propose(cmd).unwrap();
             flush(&mut nodes, msgs);
         }
 

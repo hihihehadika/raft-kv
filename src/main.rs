@@ -47,12 +47,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    use raft_kv::wal::{Wal, DiskRecord};
+    
     println!("[node {}] Starting up on {}...", cli.id, cli.addr);
     
-    // Initialize Raft node and KV Store (Note: no WAL persistence yet in Stage 4 to keep demo simple,
-    // though Stage 2 WAL could be injected here)
+    // Initialize Raft node and KV Store
     let mut node = RaftNode::new(cli.id, peer_ids);
     let mut store = KvStore::new();
+
+    // -----------------------------------------------------------------------
+    // Crash Recovery (WAL)
+    // -----------------------------------------------------------------------
+    let wal_path = format!("node_{}.wal", cli.id);
+    let mut wal = Wal::open(&wal_path)?;
+    
+    match wal.replay() {
+        Ok(records) => {
+            let count = records.len();
+            for rec in records {
+                match rec {
+                    DiskRecord::State { current_term, voted_for } => {
+                        node.current_term = current_term;
+                        node.voted_for = voted_for;
+                    }
+                    DiskRecord::Append { entry } => {
+                        node.log.push(entry);
+                    }
+                    DiskRecord::Truncate { physical_index } => {
+                        node.log.truncate(physical_index);
+                    }
+                    DiskRecord::Snapshot { last_included_index, last_included_term, store_data } => {
+                        node.last_included_index = last_included_index;
+                        node.last_included_term = last_included_term;
+                        // Sentinel
+                        node.log.clear();
+                        node.log.push(raft_kv::raft::LogEntry {
+                            term: last_included_term,
+                            command: raft_kv::raft::Command::Set { key: String::new(), value: String::new() },
+                        });
+                        node.commit_index = last_included_index as usize;
+                        node.last_applied = last_included_index as usize;
+                        store.load(store_data);
+                    }
+                }
+            }
+            if count > 0 {
+                println!("[node {}] Recovered {} records from WAL. Term: {}, Log size: {}", cli.id, count, node.current_term, node.log.len());
+            }
+        }
+        Err(e) => {
+            eprintln!("[node {}] Failed to replay WAL: {}. Starting fresh.", cli.id, e);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Network layer setup
@@ -93,12 +139,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let mut pending_clients: HashMap<u64, tokio::sync::oneshot::Sender<RpcMessage>> = HashMap::new();
+
     println!("[node {}] Cluster ready. Waiting for events...", cli.id);
 
     // -----------------------------------------------------------------------
     // The Main Event Loop
     // -----------------------------------------------------------------------
     loop {
+        let old_term = node.current_term;
+        let old_voted_for = node.voted_for;
+        let old_last_included_index = node.last_included_index;
+        let old_log = node.log.clone();
+
         tokio::select! {
             _ = ticker.tick() => {
                 // Timer logic
@@ -175,39 +228,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     RpcMessage::ClientRequest(req) => {
                         // Handle request from the CLI client
-                        let reply = match req {
+                        match req {
                             ClientRequest::Get { key } => {
                                 // Simple read (stale read possible, but okay for this demo)
-                                ClientReply::Success { value: store.get(&key).cloned() }
+                                let reply = ClientReply::Success { value: store.get(&key).cloned() };
+                                if let Some(tx) = inbound.reply_tx {
+                                    let _ = tx.send(RpcMessage::ClientReply(reply));
+                                }
                             }
                             ClientRequest::Set { key, value } => {
                                 match node.propose(Command::Set { key, value }) {
-                                    Ok(msgs) => {
+                                    Ok((log_index, msgs)) => {
                                         dispatch(msgs, &rpc_client);
-                                        // Wait, the write is PROPOSED, not committed yet. 
-                                        // A real system would block here until commit_index advances.
-                                        // For Stage 4, we'll reply Success immediately to keep it simple,
-                                        // or we can just say "Success".
-                                        ClientReply::Success { value: None }
+                                        if let Some(tx) = inbound.reply_tx {
+                                            pending_clients.insert(log_index, tx);
+                                        }
                                     }
-                                    Err(_) => ClientReply::NotLeader { leader_id: node.leader_id }
+                                    Err(_) => {
+                                        let reply = ClientReply::NotLeader { leader_id: node.leader_id };
+                                        if let Some(tx) = inbound.reply_tx {
+                                            let _ = tx.send(RpcMessage::ClientReply(reply));
+                                        }
+                                    }
                                 }
                             }
                             ClientRequest::Delete { key } => {
                                 match node.propose(Command::Delete { key }) {
-                                    Ok(msgs) => {
+                                    Ok((log_index, msgs)) => {
                                         dispatch(msgs, &rpc_client);
-                                        ClientReply::Success { value: None }
+                                        if let Some(tx) = inbound.reply_tx {
+                                            pending_clients.insert(log_index, tx);
+                                        }
                                     }
-                                    Err(_) => ClientReply::NotLeader { leader_id: node.leader_id }
+                                    Err(_) => {
+                                        let reply = ClientReply::NotLeader { leader_id: node.leader_id };
+                                        if let Some(tx) = inbound.reply_tx {
+                                            let _ = tx.send(RpcMessage::ClientReply(reply));
+                                        }
+                                    }
                                 }
                             }
                         };
-                        
-                        // Send reply back directly on the oneshot channel
-                        if let Some(tx) = inbound.reply_tx {
-                            let _ = tx.send(RpcMessage::ClientReply(reply));
-                        }
                     }
                     RpcMessage::ClientReply(_) => {
                         // Nodes don't receive client replies
@@ -230,12 +291,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[node {}] Applied {} entries to state machine. Commit index: {}", cli.id, applied, node.commit_index);
                 }
 
+                // Reply to any clients whose requests just committed
+                let mut completed_indexes = Vec::new();
+                for (&log_index, _) in pending_clients.iter() {
+                    if log_index <= node.commit_index as u64 {
+                        completed_indexes.push(log_index);
+                    }
+                }
+                for idx in completed_indexes {
+                    if let Some(tx) = pending_clients.remove(&idx) {
+                        let _ = tx.send(RpcMessage::ClientReply(ClientReply::Success { value: None }));
+                    }
+                }
+
                 // Stage 5: Log Compaction
                 if node.log.len() > 20 {
                     let compact_to = node.commit_index as u64;
                     println!("[node {}] Log size exceeded 20, compacting up to index {}...", cli.id, compact_to);
                     node.compact_log(compact_to);
                 }
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // WAL Persistence (diffing)
+        // -------------------------------------------------------------------
+        if node.current_term != old_term || node.voted_for != old_voted_for {
+            let _ = wal.append(&DiskRecord::State {
+                current_term: node.current_term,
+                voted_for: node.voted_for,
+            });
+        }
+        
+        if node.last_included_index != old_last_included_index {
+            let _ = wal.append(&DiskRecord::Snapshot {
+                last_included_index: node.last_included_index,
+                last_included_term: node.last_included_term,
+                store_data: store.dump(),
+            });
+        } else {
+            // Find common prefix length
+            let mut matching_len = 0;
+            for (a, b) in old_log.iter().zip(node.log.iter()) {
+                if a.term == b.term && a.command == b.command {
+                    matching_len += 1;
+                } else {
+                    break;
+                }
+            }
+            if matching_len < old_log.len() {
+                let _ = wal.append(&DiskRecord::Truncate { physical_index: matching_len });
+            }
+            for i in matching_len..node.log.len() {
+                let _ = wal.append(&DiskRecord::Append { entry: node.log[i].clone() });
             }
         }
     }
