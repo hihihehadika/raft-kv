@@ -10,7 +10,8 @@ This project was built to understand the inner workings of distributed systems a
 ## Features
 
 *   **Raft Consensus Protocol**: Full implementation of the Raft algorithm including leader election, log replication, and safety guarantees (based on the original [Raft paper](https://raft.github.io/raft.pdf)).
-*   **Write-Ahead Logging (WAL)**: Ensures data durability. Every transaction is appended and `fsync`-ed to disk before being applied to the in-memory state machine.
+*   **Write-Ahead Logging (WAL)**: Ensures data durability and full crash recovery. The complete Raft state (Term, VotedFor, Log) is serialized, appended, and `fsync`-ed to disk before responding to any RPC.
+*   **Strict Linearizability**: Client requests are safely blocked until the write is successfully replicated to a majority of nodes and committed to the state machine, preventing dirty reads or lost updates.
 *   **Log Compaction (Snapshotting)**: Prevents the log from growing indefinitely. The system automatically creates snapshots and sends `InstallSnapshot` RPCs to lagging followers.
 *   **Asynchronous Event Loop**: Built on top of `tokio` for efficient networking and non-blocking I/O multiplexing.
 *   **Custom RPC Layer**: A lightweight, TCP-based JSON RPC protocol with a 4-byte length prefix framing.
